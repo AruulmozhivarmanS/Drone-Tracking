@@ -60,24 +60,24 @@ class droneDetector:
         return xmin, ymin, xmax, ymax
 
 
-    def cvDrawBoxes(self, detections, img):
-        for detection in detections:
-            x, y, w, h = detection[2][0],\
-                detection[2][1],\
-                detection[2][2],\
-                detection[2][3]
-            xmin, ymin, xmax, ymax = self.convertBack(
-                float(x), float(y), float(w), float(h))
-            if detection[1] > 0.3:
-                pt1 = (xmin, ymin)
-                pt2 = (xmax, ymax)
-                cv2.rectangle(img, pt1, pt2, (0, 255, 0), 2)
-                cv2.putText(img,
-                            detection[0].decode() +
-                            " [" + str(round(detection[1] * 100, 2)) + "]",
-                            (pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            [0, 255, 0], 2)
-        
+    def cvDrawBoxes(self, name, confidance, xmin, ymin, xmax, ymax, img):
+        # for detection in detections:
+        # x, y, w, h = detection[2][0],\
+        #     detection[2][1],\
+        #     detection[2][2],\
+        #     detection[2][3]
+        # xmin, ymin, xmax, ymax = self.convertBack(
+        #     float(x), float(y), float(w), float(h))
+        # if detection[1] > 0.3:
+        pt1 = (xmin, ymin)
+        pt2 = (xmax, ymax)
+        cv2.rectangle(img, pt1, pt2, (0, 255, 0), 2)
+        cv2.putText(img,
+                    name.decode() +
+                    " [" + str(round(confidance * 100, 2)) + "]",
+                    (pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    [0, 255, 0], 2)
+    
         return img
 
     def drone_detect(self, frame):

@@ -25,6 +25,7 @@ class ballTracker:
 		self.kf = self.create_kf()
 		self.lastx, self.lasty, self.lastr = 0.,0.,0.
 		self.lastX, self.lastY, self.lastR = 0, 0, 0
+		self.droneminx, self.droneminy, self.dronemaxx, self.dronemaxy = 0, 0, 0, 0
 		self.init = 0
 		self.detected = 0
 		self.prev = 0
@@ -271,20 +272,74 @@ class ballTracker:
 		centerx, centery, rad, val = self.detectball_bounded(frame, self.init, masked)
 		return centerx, centery, rad, val
 
-	def drone_ball_detect(self, frame):
-		drone = self.drone_detector.drone_detect(frame)
-		# TODO Find the drone are and other area using depth
-		drone_bb = None #TODO
+	def drone_bb(self, detections):
+		xmins = []
+		xmaxs = []
+		bb = []
+		for detection in detections:
+			confidance, x, y, w, h = detection[1], detections[2]
+			if ((self.dronemaxx + 130) < x and (self.droneminx - 130) > x):
+				xmin, ymin, xmax, ymax = self.drone_detector.convertBack(float(x), float(y), float(w), float(h))
+				xmins.append(xmin)
+				xmaxs.append(xmax)
+			elif confidance > 0.75:
+				xmin, ymin, xmax, ymax = self.drone_detector.convertBack(float(x), float(y), float(w), float(h))
+				bb.append((xmin,xmax))
+		bb.append((min(xmins), max(xmaxs)))
+
+		return bb
+		
+	def draw_drone(self, detections, frame):
+		best_confidance = 0
+		best_detection = False
+		for detection in detections:
+			confidance, x, y, w, h = detection[1], detections[2]
+			if (self.dronemaxx + 140) < x and (self.droneminx - 140) > x and confidance > best_confidance:
+				xmin, ymin, xmax, ymax = self.drone_detector.convertBack(float(x), float(y), float(w), float(h))
+				droneminx_draw = xmin
+				droneminy_draw = ymin
+				dronemaxx_draw = xmax
+				dronemaxy_draw = ymax
+				best_confidance = confidance
+				best_detection = True
+
+			elif confidance > max(best_confidance, 0.75):
+				droneminx_draw = xmin
+				droneminy_draw = ymin
+				dronemaxx_draw = xmax
+				dronemaxy_draw = ymax
+				best_confidance = confidance
+				best_detection = True
+
+			else:
+				self.droneminx = xmin
+				self.droneminy = ymin
+				self.dronemaxx = xmax
+				self.dronemaxy = ymax
+		if detections:
+			self.drone_detector.cvDrawBoxes(b'drone', best_confidance, droneminx_draw, droneminy_draw, dronemaxx_draw, dronemaxy_draw, frame) 
+			if best_detection:
+				self.droneminx = droneminx_draw
+				self.droneminy = droneminy_draw
+				self.dronemaxx = dronemaxx_draw
+				self.dronemaxy = dronemaxy_draw		
+
+		return
+		
+	def drone_detectball(self, detections, frame):
+		drone_bb = drone_bb(detections)
 		mask = drone_mask(drone_bb)
-		return drone_Detectball(frame, mask)
+
+		return drone_circles(frame, mask)
 	
-	def drone_mask(self, drone_bb):
-		#TODO
+	def drone_mask(self, drone_bbs):
 		masked = np.zeros((480, 640), dtype=np.uint8)
-		masked = masked[:,:]
+		for drone_bb in drone_bbs:
+			masked[:, drone_bb[0]:drone_bb[1]] = 255
+
 		return masked
 
-	def drone_Detectball(self, frame, masked):
+	def drone_circles(self, frame, masked):
 		
 		hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
 		a = hsv[:,:,1]
@@ -338,7 +393,7 @@ class ballTracker:
 
 		dont=0
 		# vid = cv2.VideoCapture(0)
-		vid = cv2.VideoCapture('/media/harddisk/goutham_vids/GOPR1844.MP4')
+		vid = cv2.VideoCapture('/home/aruul/Pictures/Vid/GOPR1844.MP4')
 		total=0 
 		dropped=0 
 		recent=0
@@ -347,7 +402,7 @@ class ballTracker:
 		predictedCoords = np.zeros((2, 1), np.float32)
 		centerx, centery = 0, 0
 		cal_x, cal_y = 0, 0 
-
+		# wr_c = 0
 		# while not rospy.is_shutdown():
 		while True:
 			ret, frame = vid.read()
@@ -356,7 +411,7 @@ class ballTracker:
 			if ret==True:
 				frame = cv2.resize(frame, (640,480))
 				detections = self.drone_detector.drone_detect(frame)
-				frame = self.drone_detector.drawDrone(frame, detections)
+				
 				height, width = frame.shape[0], frame.shape[1]
 				print ("trust", trust)
 				total+=1
@@ -369,11 +424,9 @@ class ballTracker:
 					cv2.putText(frame, "Predicted", (predictedCoords[0] + 50, predictedCoords[1] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, [50, 200, 250])
 					dont=0
 					self.found+=1
-					self.prs = True
 					#print ("gotten centerx", centerx)
 					if centerx==10000 or val==0 or (centerx==0.0 and centery==0.0):
 						self.found-=1
-						self.prs = False
 						dont=1
 						trust+=1
 						if trust>20:
@@ -385,17 +438,28 @@ class ballTracker:
 					centerx, centery, rad, val = self.initial(frame, self.detected)			
 					dont=0
 					self.found+=1
-					self.prs = True
 					if centerx == 10000 or val==0 or (centerx==0.0 and centery==0.0):
 						self.found-=1
-						self.prs = False
+						dont=1
+						trust+=1
+						if trust>20:
+							predictedCoords = np.zeros((2, 1), np.float32)
+							self.detected=0
+							
+				if self.detected==0:
+					centerx, centery, rad, val = drone_detectball(detections, frame)
+					dont=0
+					self.found+=1
+					if centerx == 10000 or val==0 or (centerx==0.0 and centery==0.0):
+						self.found-=1
 						dont=1
 						trust+=1
 						if trust>20:
 							predictedCoords = np.zeros((2, 1), np.float32)
 							self.detected=0
 
-				if total<15 or self.detected==0:
+
+				if total<15:
 					
 					if dont==0:
 						self.lastX, self.lastY, self.lastR = centerx, centery, rad
@@ -410,9 +474,7 @@ class ballTracker:
 						cv2.circle(frame, (centerx, centery), rad, [0,0,255], 2, 8)
 						cv2.line(frame,(centerx, centery + 20), (centerx + 50, centery + 20), [100,100,255], 2,8)
 						cv2.putText(frame, "Actual", (centerx + 50, centery + 20), cv2.FONT_HERSHEY_SIMPLEX,0.5, [50,200,250])
-					if not self.prs and total>15:
-						cv2.imshow('Img', frame)
-						cv2.waitKey()	
+
 				else:
 					if dont==0:
 						if (centerx>=self.lastX-100) and (centerx<=self.lastX+100) and (centery>=self.lastY-100) and (centery<=self.lastY+100):
@@ -428,7 +490,7 @@ class ballTracker:
 							cv2.line(frame,(centerx, centery + 20), (centerx + 50, centery + 20), [100,100,255], 2,8)
 							cv2.putText(frame, "Actual", (centerx + 50, centery + 20), cv2.FONT_HERSHEY_SIMPLEX,0.5, [50,200,250])
 
-						
+				frame = self.draw_drone(detections, frame)		
 				self.out.write(frame)
 				# newimg =ball_xyz()
 				# newimg.centerx = centerx
@@ -448,18 +510,21 @@ class ballTracker:
 					break
 
 		print (total)
-		print (found)
+		print (self.found)
 		vid.release()
 		cv2.destroyAllWindows()
 
 def main():
 	# rospy.init_node('balltrack', anonymous=True)
 	# image_pub = rospy.Publisher("image_topic_2",ball_xyz, queue_size=1)
-	configPath = '/media/harddisk/TCS_drone_data/Drones/yuen/drone_for_yolo/yolov3-tiny.cfg'
-	weightPath = '/media/harddisk/TCS_drone_data/Drones/yuen/drone_for_yolo/backup_3/yolov3-tiny_best.weights'
-	metaPath = '/media/harddisk/TCS_drone_data/Drones/yuen/drone_for_yolo/drone.data'
+	configPath = '/home/aruul/Videos/Drone-Tracking/yolov3-tiny.cfg'
+	weightPath = '/home/aruul/Videos/Drone-Tracking/Net/yolov3-tiny_best.weights'
+	metaPath = '/home/aruul/Videos/Drone-Tracking/drone.data'
 	ball_Tracker = ballTracker(configPath, weightPath, metaPath)
 	ball_Tracker.track()
 
 if __name__=="__main__":
 	main()
+	#TODO Test new tracker
+	#TODO Calculate Accuracy
+	#TODO Convert to world coordinates
