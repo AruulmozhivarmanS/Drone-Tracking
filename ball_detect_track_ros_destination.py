@@ -1,27 +1,95 @@
 #!/usr/bin/env python
 from __future__ import print_function
 
-# import roslib
+import roslib
 # roslib.load_manifest('my_package')
 import sys
-# import rospy
+import rospy
 import cv2
 import numpy as np
-# from std_msgs.msg import String
-# from MBZIRC_control.msg import ball_xyz
-# from sensor_msgs.msg import Image
-# from cv_bridge import CvBridge, CvBridgeError
+from std_msgs.msg import String
+from MBZIRC_control.msg import ball_xyz
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
+import argparse
 # import imutils
 import math
 import time
 from drone_track import droneDetector
+import os, sys, select, termios, tty, roslib, rospy, argparse, mavros, threading, time, readline, signal, tf
+
+from sensor_msgs.msg import Joy
+from std_msgs.msg import Header, Float32, Float64, Empty
+from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3, Quaternion, Point, Twist, PointStamped
+from subprocess import call
+from mavros_msgs.msg import OverrideRCIn
+from mavros import command
+from mavros import setpoint as SP
+from mavros_msgs.msg import PositionTarget
+from nav_msgs.msg import Path, Odometry
+from visualization_msgs.msg import Marker
+
+from qp_planner.msg import algomsg
+from mavros_msgs.msg import Altitude
+from gazebo_msgs.msg import ModelStates
+
+from sensor_msgs.msg import Imu, NavSatFix
+from tf.transformations import euler_from_quaternion
+import quadprog
+from numpy import array
+from qp_matrix import qp_q_dot_des_array
+from MPC import MPC_solver
+import qp_matrix
+
+def imu_cb(data):
+	global roll, pitch, yaw
+	orientation_q = data.orientation
+	orientation_list = (orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w)
+	(roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+#(roll, pitch, yaw) = (roll * 180.0/3.1416, pitch * 180.0/3.1416, yaw  * 180.0/3.1416)
+
+def gps_local_cb(data):
+	global cart_x, cart_y, home_x, home_y, home_xy_recorded, discard_samples, desired_x, desired_y, start_y
+
+	cart_x = data.pose.pose.position.x
+	cart_y = data.pose.pose.position.y
+	cart_z = data.pose.pose.position.z
+
+global R
+global roll, pitch, yaw
+
+n = 15
+t = 0.1
+gps_rate = 0
+cont = 0
+home_xy_recorded = home_z_recorded = False
+cart_x = cart_y = cart_z = 0.0
+home_x = home_y = home_z = 0.0
+ekf_x = ekf_y = ekf_z = 0
+desired_x = desired_y =  desired_z = 0.0
+limit_x = limit_y = limit_z = 10.
+roll = pitch = yaw = 0.0
+TIMEOUT = 0.5
+kp = 1.
+kb = 10000000.0
+home_yaw = 0
+br = tf.TransformBroadcaster()
+br2 = tf.TransformBroadcaster()
+discard_samples = 20                        #samples to discard before gps normalizes
+pos = Point()
+quat = Quaternion()
+pos.x = pos.y = pos.z = 0
+quat.x = quat.y = quat.z = quat.w = 0
+start_y = 0.0
+timer = 0.0
+cached_var = {}
 
 class ballTracker:
-	# def __init__(self, image_pub, configPath, weighPath, metaPath):
-	def __init__(self, configPath, weighPath, metaPath):
-		# self.pub = pub
-		# self.y_pub = y_pub
-		# self.image_pub = image_pub
+	def __init__(self, image_pub, y_pub, pub, configPath, weighPath, metaPath):
+	# def __init__(self, configPath, weighPath, metaPath):
+		self.pub = pub
+		self.y_pub = y_pub
+		self.image_pub = image_pub
 		self.kf = self.create_kf()
 		self.lastx, self.lasty, self.lastr = 0.,0.,0.
 		self.lastX, self.lastY, self.lastR = 0, 0, 0
@@ -31,24 +99,27 @@ class ballTracker:
 		self.prev = 0
 		self.found=0
 		self.trycont = 0
-		self.out = cv2.VideoWriter('drone_trial_1.avi', cv2.VideoWriter_fourcc(*'XVID'), 20.0, (640,480))
+		self.out = cv2.VideoWriter('drone_trial_2.avi', cv2.VideoWriter_fourcc(*'XVID'), 20.0, (640,480))
 		self.prs = False
 		self.drone_detector = droneDetector(configPath, weighPath, metaPath)
-		self.im_save_count = 0
+		# self.im_save_count = 0
+		self.pos_x = 0
+		self.pos_y = 0
+		self.pos_z = 0
 
 	def getDepth(self, detHeight, detX, detY, height, width):
 
 		#detHeight *= 2
 		#f = 0.28
 		# f = 0.397 #gopro 5
-		f = 5
+		f = 0.5
 		#f = 0.400
 		ballHeight = 2*7.96
 		# sensorHeight = 0.455 #gopro 5
-		sensorHeight = 5
+		sensorHeight = 0.5
 		#sensorHeight = 0.358 #logitech c270
 		# sensorWidth = 0.617 #gopro 5
-		sensorWidth	= 5
+		sensorWidth	= 0.5
 
 		center_pixel_x, center_pixel_y = width/2, height/2
 		detX = (detX - center_pixel_x)*sensorWidth/width
@@ -139,7 +210,6 @@ class ballTracker:
 		else:
 			#print ("No circles detected via Contours")
 			return 10000,10000,10000
-		
 
 	def tryhough(self, mask, init, constraint):
 		circles = cv2.HoughCircles(mask, cv2.HOUGH_GRADIENT, constraint, 500, param1=500, param2=70, minRadius=0, maxRadius=500)
@@ -285,7 +355,37 @@ class ballTracker:
 			self.found+=1
 			return x,y,r,1
 
-	
+	def transform(self, x, y, z, X, Y, Z, roll_x, pitch_y, yaw_z):
+
+		#x,y,z are destination coordinates
+		#X,Y,Z are drone coordinates with respect to initial position
+
+		transform_matrix = np.zeros(3,4)
+		dest = np.zeros(4,1)
+		trans = np.zeros(4,1)
+
+		dest[0], dest[1], dest[2], dest[3] = x, y, z, 1
+
+		transform_matrix[0][0] = cos(yaw_z)*cos(pitch_y)
+		transform_matrix[0][1] = cos(yaw_z)*sin(pitch_y)*sin(roll_x) - sin(yaw_z)*cos(roll_x)
+		transform_matrix[0][2] = sin(yaw_z)*sin(pitch_y)*cos(roll_x) - sin(roll_x)*cos(yaw_z)
+		transform_matrix[0][3] = X
+
+		transform_matrix[1][0] = sin(yaw_z)*cos(pitch_y)
+		transform_matrix[1][1] = sin(yaw_z)*sin(pitch_y)*sin(roll_x) + cos(yaw_z)*cos(roll_x)
+		transform_matrix[1][2] = sin(yaw_z)*sin(pitch_y)*cos(roll_x) - cos(yaw_z)*sin(roll_x)
+		transform_matrix[1][3] = Y
+
+		transform_matrix[2][0] = -sin(pitch_y)
+		transform_matrix[2][1] = cos(pitch_y)*sin(roll_x)
+		transform_matrix[2][2] = cos(pitch_y)*cos(roll_x)
+		transform_matrix[2][3] = Z
+
+		transform_matrix[3][3] = 1
+
+		trans = np.matmul(transform_matrix, dest)
+
+		return(trans[0], trans[1], trans[2])
 
 	def initial(self, frame, init, detections, depth):		
 		centerx, centery, rad, val = self.detectball(frame, self.init)
@@ -395,8 +495,8 @@ class ballTracker:
 		return frame
 		
 	def drone_detectball(self, detections, frame, depth):
-		print('Heee ' + str(self.im_save_count))
-		self.im_save_count += 1
+		# print('Heee ' + str(self.im_save_count))
+		# self.im_save_count += 1
 		bbxs, bbys = self.drone_bb(detections)
 		mask = self.drone_mask(bbxs, bbys, depth)
 		cv2.imshow('Mask', mask)
@@ -488,7 +588,7 @@ class ballTracker:
 					pass
 		#cv2.imshow('mmm',masked)
 		return masked
-
+		
 	def track(self):
 		# a = 0
 		# a_c = 0
@@ -498,10 +598,12 @@ class ballTracker:
 		# c_c = 0
 		# d = 0
 		# d_c = 0
+		global home_xy_recorded, home_z_recorded, cart_x, cart_y, cart_z, desired_x, desired_y, desired_z, home_yaw
+   		global home_x, home_z, home_y, limit_x, limit_y, limit_z, kp, kb, roll, pitch, yaw, cont, gps_rate, n, t, timer, cached_var
 		dont=0
 		depth = 1000
-		# vid = cv2.VideoCapture(0)
-		vid = cv2.VideoCapture('./new.mp4')
+		vid = cv2.VideoCapture(0) # 640x480 px
+		# vid = cv2.VideoCapture('./new.mp4') 
 		total=0 
 		dropped=0 
 		recent=0
@@ -514,13 +616,23 @@ class ballTracker:
 		centerx, centery = 0, 0
 		cal_x, cal_y = 0, 0 
 		# wr_c = 0
-		# while not rospy.is_shutdown():
-		while True:
+		rate = rospy.Rate(100.0)
+		rospy.Subscriber("/mavros/imu/data", Imu, imu_cb)
+		# if(gps_rate == 0):
+		# 	rospy.Subscriber("/mavros/global_position/local", Odometry, gps_local_cb)
+		# elif(gps_rate == 1):    
+        # 	rospy.Subscriber("/global_position_slow", Odometry, gps_local_cb)
+		# else:
+        # 	gps_rate = 0
+    	# pub = rospy.Publisher('destination_point', PointStamped, queue_size = 1)
+		
+		while not rospy.is_shutdown():
+		# while True:
 			ret, frame = vid.read()
 			#frame = frame[:,0:900]
 			#time.sleep(0.1)
 			if ret==True:
-				frame = cv2.resize(frame, (640,480))
+				# frame = cv2.resize(frame, (640,480))
 				detections = self.drone_detector.drone_detect(frame)
 				
 				height, width = frame.shape[0], frame.shape[1]
@@ -595,20 +707,43 @@ class ballTracker:
 					cv2.circle(frame, (predictedCoords[0], predictedCoords[1]), rad, [0,255,255], 2, 8)
 					cv2.line(frame, (predictedCoords[0] + 16, predictedCoords[1] - 15), (predictedCoords[0] + 50, predictedCoords[1] - 30), [100, 10, 255], 2, 8)
 					cv2.putText(frame, "Predicted", (predictedCoords[0] + 50, predictedCoords[1] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, [50, 200, 250])
+					
 				if FLAG_2:
 					cv2.putText(frame, "Depth: %f"  %depth, (50, 50), cv2.FONT_HERSHEY_SIMPLEX,0.5, [50,200,250])
 					cv2.circle(frame, (centerx, centery), rad, [0,0,255], 2, 8)
 					cv2.line(frame,(centerx, centery + 20), (centerx + 50, centery + 20), [100,100,255], 2,8)
 					cv2.putText(frame, "Actual", (centerx + 50, centery + 20), cv2.FONT_HERSHEY_SIMPLEX,0.5, [50,200,250])
+					transformed_x, transformed_y, transformed_z = self.transform(cal_x, cal_y, depth, cart_x, cart_y, cart_z, roll, pitch, yaw)
+					desired_point = PointStamped(header=Header(stamp=rospy.get_rostime()))
+					desired_point.header.frame_id = 'target_location'
+			        desired_point.point.x = transformed_x
+			        desired_point.point.y = transformed_y
+			        desired_point.point.z = transformed_z
+			        self.pub.publish(desired_point)
+
 				if FLAG_3:
+					transformed_x, transformed_y, transformed_z = self.transform(cal_x, cal_y, depth, cart_x, cart_y, cart_z, roll, pitch, yaw)
+					desired_point = PointStamped(header=Header(stamp=rospy.get_rostime()))
+					desired_point.header.frame_id = 'target_location'
+					desired_point.point.x = transformed_x
+					desired_point.point.y = transformed_y
+					desired_point.point.z = transformed_z
+					self.pub.publish(desired_point)	
+					# TODO To be published
+					velocity = ((transformed_x - self.pos_x)/(prev_time - time.time()), (transformed_y - self.pos_y)/(prev_time - time.time()), (transformed_z - self.pos_z)/(prev_time - time.time()))	
 					cv2.putText(frame, "Depth: %f"  %depth, (50, 50), cv2.FONT_HERSHEY_SIMPLEX,0.5, [50,200,250])
 					cv2.circle(frame, (centerx, centery), rad, [0,0,255], 2, 8)
 					cv2.line(frame,(centerx, centery + 20), (centerx + 50, centery + 20), [100,100,255], 2,8)
 					cv2.putText(frame, "Actual", (centerx + 50, centery + 20), cv2.FONT_HERSHEY_SIMPLEX,0.5, [50,200,250])
-
+				
 				frame = self.draw_drone(detections, frame)	
-					# 	
+				self.pos_x, self.pos_y, self.pos_z = transformed_x, transformed_y, transformed_z
+				prev_time = time.time()
 				self.out.write(frame)
+				newimg =ball_xyz()
+				newimg.centerx = centerx
+				newimg.centery = centery
+				newimg.radius = rad	
 				# if total > 15:
 				# 	# if depth < 1000:
 				# 	if detections:
@@ -631,36 +766,38 @@ class ballTracker:
 				# newimg.centerx = centerx
 				# newimg.centery = centery
 				# newimg.radius = rad	
-				cv2.imshow('Input', frame)
+				# cv2.imshow('Input', frame)
 				cv2.waitKey(1)
 				#use depth, cal_x, cal_y to get (z,x,y)
-				# try:
-				#   self.image_pub.publish(newimg)
-				# except CvBridgeError as e:
-				#   print(e)
+				try:
+				  self.image_pub.publish(newimg)
+				except CvBridgeError as e:
+				  print(e)
 
 			else:
 				dropped+=1
 				if dropped>100:
 					break
+		vid.release()
+		cv2.destroyAllWindows()
 		# print(' : ' + str(a/a_c))
 		# print(' : ' + str(a/a_c))
 		# print(' : ' + str(a/a_c))
 		# print(' : ' + str(a/a_c))
 		print (total)
 		print (self.found)
-		vid.release()
-		cv2.destroyAllWindows()
+		
 
 def main():
 	# rospy.init_node('balltrack', anonymous=True)
+	# rospy.init_node('MAVROS_Listener')
 	# image_pub = rospy.Publisher("image_topic_2",ball_xyz, queue_size=1)
+	# y_pub = rospy.Publisher('y_graph', Float32, queue_size = 5)
 	configPath = './yolov3-tiny.cfg'
 	weightPath = './Net/yolov3-tiny_best.weights'
 	metaPath = './drone.data'
-	ball_Tracker = ballTracker(configPath, weightPath, metaPath)
+	ball_Tracker = ballTracker(image_pub, y_pub, pub, configPath, weightPath, metaPath)
 	ball_Tracker.track()
 
 if __name__=="__main__":
 	main()
-
